@@ -5,20 +5,29 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Reflection;
-using System.Text;
 using System.Text.RegularExpressions;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace sce
 {
-    class SelfCompilingExecutable
+    public class SelfCompilingExecutable
     {
         static int Main(string[] args)
         {
             try
             {
-                sce.SelfCompilingExecutable.Update();
-                return Program.Main(args);
+                var sce = new SelfCompilingExecutable(FS.GetExecutable());
+
+                if (args.Length >= 1 && string.Equals(args[0], "watch"))
+                {
+                    sce.Watch();
+                    return 0;
+                }
+                else
+                {
+                    return sce.Run().Result;
+                }
             }
             catch (Exception e)
             {
@@ -27,62 +36,103 @@ namespace sce
             }
         }
 
-        static void Concat(ref string s, char c)
+        readonly string executable;
+        readonly string sourceDir;
+        readonly string cacheDir;
+        readonly Nuget.Repository repository;
+
+        public SelfCompilingExecutable(string executable, string cacheRoot = null)
         {
-            if (s == null)
+            if (cacheRoot == null)
             {
-                s = String.Empty;
+                cacheRoot = Path.Combine(Path.GetTempPath(), "sce");
             }
-            s = s + c;
+
+            this.executable = Path.GetFullPath(executable);
+            this.cacheDir = Path.Combine(cacheRoot, Util.GetDigest(this.executable));
+            this.sourceDir = this.executable + ".src";
+            repository = new Nuget.Repository(Path.Combine(cacheRoot, "packages"));
+            FS.EnsureDirectoryExists(this.cacheDir);
         }
 
-        static IEnumerable<string> SplitCommandLine(string commandLine)
-        {
-            bool inQuotes = false;
-            string p = null;
+        string OutputFile => Path.Combine(cacheDir, "a.dll");
 
-            foreach (var c in commandLine)
+        public void Watch()
+        {
+            var fsw = new FileSystemWatcher(sourceDir);
+            fsw.BeginInit();
+            fsw.EnableRaisingEvents = true;
+            fsw.IncludeSubdirectories = true;
+            fsw.EndInit();
+
+            for (; ; )
             {
-                if (inQuotes)
+                if (IsBuildRequired(sourceDir, OutputFile))
                 {
-                    if (c == '"')
+                    try
                     {
-                        inQuotes = false;
-                        Concat(ref p, c);
+                        Build(sourceDir, OutputFile, repository).Wait();
+                        Console.WriteLine("Build succeeded.");
+                        var result = Run().Result;
+                        Console.WriteLine("Exit code: {0}", result);
+                        Util.StartProcess(Environment.CommandLine);
+                        Environment.Exit(0);
                     }
-                    else
+                    catch (AggregateException e)
                     {
-                        Concat(ref p, c);
+                        Console.WriteLine("Build failed.");
+                        Console.WriteLine(e.InnerExceptions[0]);
                     }
                 }
-                else
-                {
-                    if (c == '"')
-                    {
-                        inQuotes = true;
-                        Concat(ref p, c);
-                    }
-                    else
-                    {
-                        if (Char.IsWhiteSpace(c))
-                        {
-                            if (p != null)
-                            {
-                                yield return p;
-                                p = null;
-                            }
-                        }
-                        else
-                        {
-                            Concat(ref p, c);
-                        }
-                    }
-                }
+                Console.WriteLine("Waiting for changes in {0}", sourceDir);
+                fsw.WaitForChanged(WatcherChangeTypes.All);
+                Thread.Sleep(TimeSpan.FromMilliseconds(500));
+            }
+        }
+
+        public async Task<int> Run()
+        {
+            try
+            {
+                return await RunImpl();
+            }
+            catch (Exception e)
+            {
+                Console.Error.WriteLine(e);
+                return -1;
+            }
+        }
+
+        async Task<int> RunImpl()
+        {
+            // locate compiled assembly
+            FS.EnsureDirectoryExists(cacheDir);
+            log(cacheDir);
+
+            var sourceDir = GetSourceDir();
+            EnsureSourceDirectoryExists(sourceDir);
+
+            // still up-to-date ?
+            if (IsBuildRequired(sourceDir, OutputFile))
+            {
+                await Build(sourceDir, OutputFile, repository);
             }
 
-            if (p != null)
+            // run
+            var a = Assembly.LoadFrom(OutputFile);
+            return Run(a);
+        }
+
+        static int Run(Assembly a)
+        {
+            var result = a.EntryPoint.Invoke(null, new object[] { Environment.GetCommandLineArgs() });
+            if (result is int)
             {
-                yield return p;
+                return (int)result;
+            }
+            else
+            {
+                return 0;
             }
         }
 
@@ -91,39 +141,26 @@ namespace sce
             Trace.WriteLine(String.Format(f, args), "sce");
         }
 
-        static Process StartProcess(string commandline)
+        static string StripResourcePrefix(string resourceName)
         {
-            var args = SplitCommandLine(commandline).ToList();
-            var fileName = args[0];
-            var arguments = commandline.Substring(fileName.Length);
-            log("restart: commandline={2}, fileName={0}, arguments={1}", fileName, arguments, commandline);
-            return Process.Start(new ProcessStartInfo()
-            {
-                FileName = fileName,
-                Arguments = arguments,
-                UseShellExecute = false,
-                CreateNoWindow = false
-            });
+            return resourceName.Substring(resourceName.IndexOf('.') + 1);
         }
 
-        static void EnsureDirectoryExists(string d)
+        static string GetSourceDir()
         {
-            if (!Directory.Exists(d))
-            {
-                Directory.CreateDirectory(d);
-            }
+            return FS.GetExecutable() + ".src";
         }
 
-        static string StripPrefix(string prefix, string text)
+        internal static bool IsBuildRequired(string sourceDir, string outputFile)
         {
-            if (text.StartsWith(prefix))
+            var o = new FileInfo(outputFile);
+            var sourceFiles = new DirectoryInfo(sourceDir).GetFiles("*.*", SearchOption.AllDirectories);
+            var changed = sourceFiles.Where(_ => _.LastWriteTimeUtc > o.LastWriteTimeUtc);
+            if (changed.Any())
             {
-                return text.Substring(prefix.Length);
+                log("Source files have changed: {0}", String.Join(", ", changed.Cast<object>().ToArray()));
             }
-            else
-            {
-                throw new ArgumentOutOfRangeException("text", text, String.Format("{0} does not start with prefix {1}", text, prefix));
-            }
+            return changed.Any();
         }
 
         static void EnsureSourceDirectoryExists(string sourceDir)
@@ -132,14 +169,12 @@ namespace sce
             {
                 Directory.CreateDirectory(sourceDir);
 
-                var executable = new FileInfo(GetExecutable());
-
                 // write source files
                 var a = Assembly.GetExecutingAssembly();
-                var embeddedResourcePrefix = a.GetName().Name + ".";
-                foreach (var i in a.GetManifestResourceNames())
+                const string embeddedResourcePrefix = "source.";
+                foreach (var i in a.GetManifestResourceNames().Where(_ => _.StartsWith(embeddedResourcePrefix)))
                 {
-                    var destination = Path.Combine(sourceDir, StripPrefix(embeddedResourcePrefix, i));
+                    var destination = Path.Combine(sourceDir, Util.StripPrefix(embeddedResourcePrefix, i));
                     using (var w = File.OpenWrite(destination))
                     {
                         using (var r = a.GetManifestResourceStream(i))
@@ -147,111 +182,108 @@ namespace sce
                             r.CopyTo(w);
                         }
                     }
-                    new FileInfo(destination).LastWriteTimeUtc = executable.LastWriteTimeUtc;
                 }
             }
         }
 
-        static void EnsureFileNotExists(string f)
+        static IEnumerable<KeyValuePair<string, string>> GetMetaData(FileInfo file)
         {
-            if (File.Exists(f))
+            using (var r = File.OpenText(file.FullName))
             {
-                File.Delete(f);
-            }
-        }
-
-        static void TryDelete(string f)
-        {
-            if (File.Exists(f))
-            {
-                try
+                for (; ; )
                 {
-                    File.Delete(f);
-                }
-                catch (System.UnauthorizedAccessException)
-                {
+                    var line = r.ReadLine();
+                    if (line == null) break;
+                    var m = Regex.Match(line, @"//\s+(?<key>[\w-]+)\s*:\s*(?<value>.*)");
+                    if (m.Success)
+                    {
+                        yield return new KeyValuePair<string, string>(m.Groups["key"].Value, m.Groups["value"].Value);
+                    }
                 }
             }
         }
 
-        static string GetBinDir()
+        public static ILookup<string, string> GetMetaData(FileInfo[] files)
         {
-            return Path.GetDirectoryName(GetExecutable());
+            return files.SelectMany(_ => GetMetaData(_)).ToLookup(_ => _.Key, _ => _.Value);
         }
 
-        static string GetExecutable()
-        {
-            var b = Assembly.GetEntryAssembly().Location;
-            return b;
-        }
+        const string nugetSourceKeyWord = "nuget-source";
+        const string nugetPackageKeyWord = "nuget-package";
 
-        static string GetSourceDir()
-        {
-            return GetExecutable() + ".src";
-        }
-        internal static void Update()
-        {
-            const string newExePrefix = "new-sce-";
-            const string oldExePrefix = "old-sce-";
-
-            var sourceDir = GetSourceDir();
-
-            var outputFile = new FileInfo(GetExecutable());
-            var oldExecutable = Path.Combine(outputFile.Directory.FullName, oldExePrefix + outputFile.Name);
-
-            TryDelete(oldExecutable);
-
-            EnsureSourceDirectoryExists(sourceDir);
+        internal static async Task Build(string sourceDir, string outputFile, Nuget.Repository repository)
+        { 
+            string outputDir = Path.GetDirectoryName(outputFile);
 
             var sourceFiles = new DirectoryInfo(sourceDir).GetFiles("*.*", SearchOption.AllDirectories);
-            var changed = sourceFiles.Where(_ => _.LastWriteTimeUtc > outputFile.LastWriteTimeUtc);
 
-            if (changed.Any())
+            var metaData = GetMetaData(sourceFiles);
+
+            var nugetSources = metaData[nugetSourceKeyWord].Distinct()
+                .Select(Nuget.GetSource)
+                .ToList();
+
+            if (!nugetSources.Any())
             {
-                log("Source files have changed: {0}", String.Join(", ", changed.Cast<object>().ToArray()));
+                nugetSources = new List<Nuget.ISource> { Nuget.GetDefaultSource() };
+            }
 
-                // nuget restore
+            var nugetPackages = metaData[nugetPackageKeyWord].Distinct().ToList();
 
-                // compile
-                var csharpProvider = new Microsoft.CSharp.CSharpCodeProvider();
-                var newExecutable = Path.Combine(outputFile.Directory.FullName, newExePrefix + outputFile.Name);
+            var installedNugetPackages = await repository.EnsurePackagesAreInstalled(nugetSources, nugetPackages);
 
+            // compile
+            var csharpProvider = new Microsoft.CSharp.CSharpCodeProvider();
 
-                var options = new CompilerParameters()
+            var externalReferences = installedNugetPackages.SelectMany(_ => _.GetReferenceAssemblies()).ToArray();
+
+            foreach (var i in externalReferences)
+            {
+                Copy(i, Path.Combine(outputDir, Path.GetFileName(i)));
+            }
+
+            var internalReferences = new[]{
+                "System.Runtime.dll",
+                "System.dll",
+                "System.Xml.dll",
+                "Microsoft.CSharp.dll",
+                "System.Core.dll",
+            };
+
+            var options = new CompilerParameters()
+            {
+                OutputAssembly = outputFile,
+                GenerateExecutable = true,
+                IncludeDebugInformation = false,
+                GenerateInMemory = false,
+                MainClass = "Program",
+            };
+
+            options.ReferencedAssemblies.AddRange(internalReferences.Concat(externalReferences).ToArray());
+
+            var results = csharpProvider.CompileAssemblyFromFile(options, sourceFiles.Where(Util.IsCSharpFile).Select(_ => _.FullName).ToArray());
+            if (results.Errors.Cast<object>().Any())
+            {
+                var s = String.Join("\r\n", results.Errors.Cast<object>().ToArray());
+                throw new Exception(s);
+            }
+        }
+
+        private static void Copy(string i, string v)
+        {
+            log("{0} -> {1}", i, v);
+            File.Copy(i, v, true);
+        }
+
+        internal static void PrintReadme()
+        {
+            var a = Assembly.GetExecutingAssembly();
+            using (var r = a.GetManifestResourceStream("Readme.md"))
+            {
+                if (r != null)
                 {
-                    OutputAssembly = newExecutable,
-                    GenerateExecutable = true,
-                    IncludeDebugInformation = false,
-                    MainClass = "sce.SelfCompilingExecutable",
-                    GenerateInMemory = false,
-                };
-
-                options.ReferencedAssemblies.AddRange(new[]
-                {
-                    "System.dll",
-                    "Microsoft.CSharp.dll",
-                    // "System.Xml.Linq.dll",
-                    "System.Core.dll"
-                });
-
-                options.EmbeddedResources.AddRange(sourceFiles.Select(_ => _.FullName).ToArray());
-
-                log(Assembly.GetAssembly(csharpProvider.GetType()).Location);
-
-                var results = csharpProvider.CompileAssemblyFromFile(options, sourceFiles.Select(_ => _.FullName).ToArray());
-                if (results.Errors.Cast<object>().Any())
-                {
-                    Console.Error.WriteLine(String.Join("\r\n", results.Errors.Cast<object>().ToArray()));
-                    Environment.Exit(-1);
+                    Console.WriteLine(new StreamReader(r).ReadToEnd());
                 }
-
-                File.Move(outputFile.FullName, oldExecutable);
-                File.Move(newExecutable, outputFile.FullName);
-                var currentProcess = Process.GetCurrentProcess();
-                var newProcess = StartProcess(Environment.CommandLine);
-
-                newProcess.WaitForExit();
-                Environment.Exit(newProcess.ExitCode);
             }
         }
     }
