@@ -30,3 +30,8 @@ When invoked with
 sce.exe watch
 ~~~~
 , the executable will constantly monitor the source files and compile and run on any change.
+
+## To Do
+* When name ist sce.exe, the program should prompt the user for a script name and generate it.
+* support nuget from v2 and file sources
+* load nuget dependencies automatically
